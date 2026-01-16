@@ -9,17 +9,15 @@ from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 bot = TeleBot(os.getenv('BOT_TOKEN'))
-BANKROT_URL = "https://bankrot.fedresurs.ru"
+FEDRESURS_URL = "https://fedresurs.ru"
 
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
-    'Referer': f'{BANKROT_URL}/',
-    'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="122", "Google Chrome";v="122"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"'
+    'Referer': f'{FEDRESURS_URL}/search/entity',
+    'Content-Type': 'application/json'
 })
 
 def init_db():
@@ -46,39 +44,56 @@ def get_user_inns(user_id):
 
 def parse_bankrot(inn):
     try:
-        # Поиск через GET (упрощено)
-        params = {'inn': inn}
-        resp = session.get(f"{BANKROT_URL}/search-results", params=params, timeout=15)
+        # ✅ ПРЯМОЙ БЕКЕНД ПОИСК ПО ИНН (как в Habr)
+        if len(inn) == 10:
+            endpoint = "companies"
+        elif len(inn) == 12:
+            endpoint = "persons"  
+        else:
+            return f"❌ ИНН `{inn}`: 10/12 цифр"
         
-        # Ищем GUID
-        guid_match = re.search(r'"guid":"([a-f0-9\-]+)', resp.text)
-        if not guid_match:
+        # Шаг 1: Поиск по code=ИНН
+        search_url = f"{FEDRESURS_URL}/backend/{endpoint}?limit=1&offset=0&code={inn}"
+        resp = session.get(search_url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if not data.get('pageData'):
             return f"❌ ИНН `{inn}` не найден в ЕФРСБ"
         
-        guid = guid_match.group(1)
+        person = data['pageData'][0]
+        guid = person['guid']
+        name = person.get('shortName', person.get('fullName', 'N/A'))[:50]
         
-        # Публикации (попытка persons/companies)
-        for entity in ['persons', 'companies']:
-            try:
-                pubs_url = f"{BANKROT_URL}/backend/{entity}/{guid}/publications"
-                resp_pubs = session.get(pubs_url, params={'limit': 10}, timeout=10)
-                if resp_pubs.status_code == 200:
-                    pubs = resp_pubs.json()
-                    if pubs.get('pageData'):
-                        result = f"✅ *Банкротства ИНН {inn}*\n({pubs['total']} публикаций)\n\n"
-                        for item in pubs['pageData'][:8]:
-                            number = item.get('number', 'N/A')
-                            type_name = item.get('typeName', 'Неизвестно')
-                            date = item.get('datePublish', '')[:10]
-                            result += f"• `{number}`\n  {type_name} | {date}\n\n"
-                        return result
-            except:
-                continue
+        # Шаг 2: Публикации банкрота
+        pubs_url = f"{FEDRESURS_URL}/backend/{endpoint}/{guid}/publications"
+        params = {
+            'limit': 10, 'offset': 0,
+            'searchPersonEfrsbMessage': 'true',
+            'searchPersonBankruptMessage': 'true',
+            'searchAmReport': 'true'
+        }
+        session.headers['Referer'] = f"{FEDRESURS_URL}/persons/{guid}"
+        resp_pubs = session.get(pubs_url, params=params, timeout=15)
+        pubs_data = resp_pubs.json()
         
-        return f"✅ ИНН `{inn}` найден, публикаций нет"
+        pubs_count = pubs_data.get('total', 0)
+        result = f"✅ *{name}*\n"
+        result += f"`ИНН: {inn}` | 👤 {endpoint}\n"
+        result += f"📄 Публикаций: *{pubs_count}*\n🔗 [{FEDRESURS_URL}/persons/{guid}]\n\n"
+        
+        if pubs_data.get('pageData'):
+            result += "📋 *Последние публикации:*\n\n"
+            for item in pubs_data['pageData'][:6]:
+                number = item.get('number', 'N/A')
+                type_name = item.get('typeName', item.get('type', 'Неизвестно'))[:30]
+                date = item.get('datePublish', 'N/A')[:10]
+                result += f"• `{number}` | {type_name}\n  _{date}_\n\n"
+        
+        return result[:4000]
     except Exception as e:
-        logging.error(f"Parse {inn}: {e}")
-        return f"💥 Сервис временно недоступен"
+        logging.error(f"Parse error {inn}: {e}")
+        return f"💥 Поиск `{inn}`: временная ошибка сервера"
 
 init_db()
 
@@ -89,9 +104,9 @@ def start(message):
     markup.add(KeyboardButton('/clear_inns'))
     bot.send_message(message.chat.id,
         "🔍 *Fedresurs Inline Bot*\n\n"
-        "`/add_inn 340735628010` — сохранить + поиск\n"
-        "`@yourbot 340735628010` — inline\n"
-        "`/my_inns` — кнопки поиска", 
+        "`/add_inn 340735628010` ← Твой ИНН!\n"
+        "`@botname 340735628010` ← Inline\n"
+        "`/my_inns` ← Кнопки", 
         reply_markup=markup, parse_mode='Markdown')
 
 @bot.message_handler(commands=['add_inn'])
@@ -102,12 +117,12 @@ def add_inn_cmd(message):
         return
     
     inn = re.sub(r'\D', '', parts[1])[:12]
-    if len(inn) not in [10, 12] or not inn.isdigit():
-        bot.reply_to(message, "❌ ИНН: только 10/12 цифр")
+    if len(inn) not in [10, 12]:
+        bot.reply_to(message, "❌ Только 10/12 цифр")
         return
     
     add_inn(message.from_user.id, inn)
-    bot.reply_to(message, f"⏳ Сохраняем `{inn}` и ищем...")
+    bot.reply_to(message, f"⏳ Сохраняем `{inn}`...")
     
     result = parse_bankrot(inn)
     bot.reply_to(message, result, parse_mode='Markdown')
@@ -116,14 +131,14 @@ def add_inn_cmd(message):
 def my_inns(message):
     inns = get_user_inns(message.from_user.id)
     if not inns:
-        bot.reply_to(message, "📝 `/add_inn 340735628010` — сохрани первый")
+        bot.reply_to(message, "📝 `/add_inn 340735628010`")
         return
     
     markup = InlineKeyboardMarkup(row_width=1)
     for inn in inns:
         markup.add(InlineKeyboardButton(inn, callback_data=f"search:{inn}"))
     
-    text = f"📋 `{message.from_user.first_name}`, твои ИНН ({len(inns)}):\n\n" + "\n".join([f"• `{inn}`" for inn in inns])
+    text = f"📋 *Твои ИНН* ({len(inns)}):\n\n" + "\n".join([f"• `{inn}`" for inn in inns])
     bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode='Markdown')
 
 @bot.message_handler(commands=['clear_inns'])
@@ -133,24 +148,22 @@ def clear_inns(message):
     c.execute("DELETE FROM user_inns WHERE user_id = ?", (message.from_user.id,))
     conn.commit()
     conn.close()
-    bot.reply_to(message, "🗑 ИНН удалены")
+    bot.reply_to(message, "🗑 Очищено")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('search:'))
 def callback_search(call):
-    inn = call.data.split(':', 1)[1]
-    bot.answer_callback_query(call.id, "🔍 Ищем...")
+    inn = call.data[7:]
+    bot.answer_callback_query(call.id, "🔍")
     result = parse_bankrot(inn)
     bot.edit_message_text(result, call.message.chat.id, call.message.message_id, parse_mode='Markdown')
 
-# ✅ ИСПРАВЛЕННЫЕ INLINE ОБРАБОТЧИКИ
+# ✅ Inline обработчики
 @bot.inline_handler(lambda query: bool(query.query))
 def inline_query(query):
     inn = re.sub(r'\D', '', query.query)[:12]
     if len(inn) not in [10, 12]:
-        r = InlineQueryResultArticle(
-            id="error", title="Ошибка ИНН", 
-            input_message_content=InputTextMessageContent("💡 10-12 цифр")
-        )
+        r = InlineQueryResultArticle(id="err", title="Ошибка", 
+            input_message_content=InputTextMessageContent("💡 10-12 цифр"))
         bot.answer_inline_query(query.id, [r])
         return
     
@@ -165,12 +178,11 @@ def inline_query(query):
 @bot.inline_handler(func=lambda query: not query.query)
 def inline_empty(query):
     r = InlineQueryResultArticle(
-        id="help", title="🔍 Fedresurs",
-        description="340735628010",
-        input_message_content=InputTextMessageContent("Напиши ИНН (10-12 цифр)")
+        id="help", title="Fedresurs", 
+        input_message_content=InputTextMessageContent("🔍 Напиши ИНН")
     )
     bot.answer_inline_query(query.id, [r])
 
 if __name__ == '__main__':
-    logging.info("🚀 Fedresurs Inline Bot ✅")
-    bot.polling(none_stop=True, interval=1, timeout=30)
+    logging.info("🚀 Fedresurs Bot ✅")
+    bot.polling(none_stop=True)
