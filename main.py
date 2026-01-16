@@ -3,18 +3,20 @@ import sqlite3
 import requests
 import re
 import logging
+from bs4 import BeautifulSoup
 from telebot import TeleBot
 from telebot.types import (InlineKeyboardMarkup, InlineKeyboardButton, 
                           InlineQueryResultArticle, InputTextMessageContent)
 from datetime import datetime
 from contextlib import contextmanager
+import time
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
-        logging.FileHandler('bot.log'),
+        logging.FileHandler('bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -28,11 +30,12 @@ DB_PATH = 'inns.db'
 # Настройки сессии
 session = requests.Session()
 session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'ru-RU,ru;q=0.9',
-    'Referer': f'{FEDRESURS_URL}/search/entity',
-    'Content-Type': 'application/json'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1'
 })
 
 # ============== DATABASE ==============
@@ -136,88 +139,264 @@ def update_user_settings(user_id, **kwargs):
         logger.error(f"Ошибка обновления настроек для {user_id}: {e}")
         return False
 
-# ============== FEDRESURS API ==============
-def parse_bankrot(inn, max_pubs=5):
-    """Парсинг данных о банкротстве"""
+# ============== FEDRESURS PARSER ==============
+def search_by_inn(inn):
+    """Поиск по ИНН через страницу поиска"""
     try:
         inn = re.sub(r'\D', '', inn)[:12]
         
-        if len(inn) == 10:
-            endpoint = "companies"
-        elif len(inn) == 12:
-            endpoint = "persons"
-        else:
+        if len(inn) not in [10, 12]:
+            return None
+        
+        # Формируем правильный URL для поиска
+        search_url = f"{FEDRESURS_URL}/entities"
+        params = {
+            'searchString': inn,
+            'regionNumber': 'all',
+            'isActive': 'true',
+            'offset': 0,
+            'limit': 15
+        }
+        
+        logger.info(f"Поиск ИНН {inn}...")
+        
+        # Делаем запрос
+        time.sleep(0.5)
+        resp = session.get(search_url, params=params, timeout=20)
+        resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # Ищем все возможные варианты ссылок на профиль
+        profile_links = []
+        
+        # Вариант 1: Ссылки с классом entity-item, card-link и т.д.
+        for link in soup.find_all('a', href=True):
+            href = link.get('href', '')
+            if '/entities/' in href or '/persons/' in href or '/companies/' in href:
+                profile_links.append(href)
+        
+        # Вариант 2: Поиск по data-атрибутам
+        for elem in soup.find_all(attrs={'data-entity-id': True}):
+            entity_id = elem.get('data-entity-id')
+            if entity_id:
+                profile_links.append(f"/entities/{entity_id}")
+        
+        # Вариант 3: Ищем таблицу или список результатов
+        results_container = soup.find('div', class_=['search-results', 'results', 'entities-list'])
+        if results_container:
+            for link in results_container.find_all('a', href=True):
+                href = link.get('href', '')
+                if '/entities/' in href:
+                    profile_links.append(href)
+        
+        if not profile_links:
+            logger.warning(f"Ссылки на профиль не найдены для ИНН {inn}")
+            # Сохраняем HTML для отладки
+            with open(f'debug_{inn}.html', 'w', encoding='utf-8') as f:
+                f.write(resp.text)
+            logger.info(f"HTML сохранён в debug_{inn}.html")
+            return None
+        
+        # Берём первую найденную ссылку
+        profile_path = profile_links[0]
+        profile_url = profile_path if profile_path.startswith('http') else FEDRESURS_URL + profile_path
+        
+        logger.info(f"Найден профиль: {profile_url}")
+        return profile_url
+        
+    except requests.Timeout:
+        logger.error(f"Timeout при поиске ИНН {inn}")
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка поиска ИНН {inn}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+def parse_profile(profile_url):
+    """Парсинг страницы профиля"""
+    try:
+        time.sleep(0.5)
+        resp = session.get(profile_url, timeout=20)
+        resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        # Сохраняем HTML для отладки
+        entity_id = profile_url.split('/')[-1]
+        with open(f'profile_{entity_id}.html', 'w', encoding='utf-8') as f:
+            f.write(resp.text)
+        
+        data = {
+            'url': profile_url,
+            'name': None,
+            'inn': None,
+            'type': 'persons' if '/persons/' in profile_url else 'companies',
+            'publications': []
+        }
+        
+        # Извлекаем название (различные варианты)
+        name_selectors = [
+            ('h1', {}),
+            ('div', {'class': 'entity-name'}),
+            ('div', {'class': 'card-title'}),
+            ('span', {'class': 'name'}),
+            ('div', {'class': 'title'})
+        ]
+        
+        for tag, attrs in name_selectors:
+            name_elem = soup.find(tag, attrs)
+            if name_elem:
+                data['name'] = name_elem.get_text(strip=True)
+                break
+        
+        if not data['name']:
+            # Ищем любой крупный текст в начале страницы
+            for elem in soup.find_all(['h1', 'h2', 'div'], limit=10):
+                text = elem.get_text(strip=True)
+                if len(text) > 10 and len(text) < 200:
+                    data['name'] = text
+                    break
+        
+        # Извлекаем ИНН
+        inn_patterns = [
+            re.compile(r'ИНН[:\s]*(\d{10,12})'),
+            re.compile(r'inn[:\s]*(\d{10,12})', re.IGNORECASE),
+            re.compile(r'(\d{10,12})')
+        ]
+        
+        page_text = soup.get_text()
+        for pattern in inn_patterns:
+            match = pattern.search(page_text)
+            if match:
+                potential_inn = match.group(1)
+                if len(potential_inn) in [10, 12]:
+                    data['inn'] = potential_inn
+                    break
+        
+        # Извлекаем публикации
+        pub_selectors = [
+            ('div', {'class': 'publication-item'}),
+            ('div', {'class': 'publication'}),
+            ('tr', {'class': 'publication-row'}),
+            ('div', {'class': 'message'}),
+            ('article', {}),
+        ]
+        
+        pub_items = []
+        for tag, attrs in pub_selectors:
+            items = soup.find_all(tag, attrs, limit=15)
+            if items:
+                pub_items.extend(items)
+                break
+        
+        # Если не нашли через селекторы, ищем все ссылки на публикации
+        if not pub_items:
+            for link in soup.find_all('a', href=re.compile(r'/publication/')):
+                pub_items.append(link.find_parent())
+        
+        for item in pub_items[:10]:
+            if not item:
+                continue
+                
+            pub = {}
+            item_text = item.get_text()
+            
+            # Номер публикации
+            num_match = re.search(r'№\s*(\d+)', item_text)
+            if num_match:
+                pub['number'] = num_match.group(1)
+            else:
+                pub['number'] = 'Б/Н'
+            
+            # Тип публикации (берём самую длинную строку как описание)
+            lines = [line.strip() for line in item_text.split('\n') if len(line.strip()) > 10]
+            if lines:
+                pub['type'] = max(lines, key=len)[:80]
+            else:
+                pub['type'] = 'Не указан'
+            
+            # Дата
+            date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', item_text)
+            if date_match:
+                pub['date'] = date_match.group(1)
+            else:
+                pub['date'] = 'Нет даты'
+            
+            data['publications'].append(pub)
+        
+        # Общее количество публикаций
+        total_patterns = [
+            re.compile(r'Найдено[:\s]*(\d+)'),
+            re.compile(r'Всего[:\s]*(\d+)'),
+            re.compile(r'(\d+)\s*публикаций'),
+            re.compile(r'(\d+)\s*сообщений')
+        ]
+        
+        data['total_pubs'] = len(data['publications'])
+        for pattern in total_patterns:
+            match = pattern.search(page_text)
+            if match:
+                data['total_pubs'] = int(match.group(1))
+                break
+        
+        logger.info(f"Распарсено: {data['name']}, ИНН: {data['inn']}, публикаций: {data['total_pubs']}")
+        return data
+        
+    except Exception as e:
+        logger.error(f"Ошибка парсинга профиля {profile_url}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+
+def parse_bankrot(inn, max_pubs=5):
+    """Основная функция парсинга"""
+    try:
+        inn = re.sub(r'\D', '', inn)[:12]
+        
+        if len(inn) not in [10, 12]:
             return {
                 'success': False,
                 'message': f"❌ Неверный формат ИНН\n\nДолжен быть 10 цифр (юрлицо) или 12 (физлицо)\nВы ввели: `{inn}` ({len(inn)} цифр)"
             }
         
-        # Поиск по ИНН
-        search_url = f"{FEDRESURS_URL}/backend/{endpoint}"
-        params = {'limit': 1, 'offset': 0, 'code': inn}
-        
-        resp = session.get(search_url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if not data.get('pageData'):
+        # Шаг 1: Поиск профиля
+        profile_url = search_by_inn(inn)
+        if not profile_url:
             return {
                 'success': False,
-                'message': f"❌ ИНН `{inn}` не найден в ЕФРСБ\n\n💡 Проверьте правильность ввода"
+                'message': f"❌ ИНН `{inn}` не найден в ЕФРСБ\n\n💡 Возможные причины:\n• ИНН введён неверно\n• Данные отсутствуют в базе\n• Проблемы с сайтом fedresurs.ru\n\nПопробуйте:\n1. Проверить ИНН\n2. Повторить через минуту"
             }
         
-        person = data['pageData'][0]
-        guid = person['guid']
-        name = person.get('shortName') or person.get('fullName', 'Не указано')
-        full_name = person.get('fullName', name)
+        # Шаг 2: Парсинг профиля
+        data = parse_profile(profile_url)
+        if not data:
+            return {
+                'success': False,
+                'message': f"❌ Не удалось загрузить данные\n\nСтраница найдена, но структура не распознана.\nПопробуйте позже или проверьте вручную:\n{profile_url}"
+            }
         
-        # Получение публикаций
-        pubs_url = f"{FEDRESURS_URL}/backend/{endpoint}/{guid}/publications"
-        pubs_params = {
-            'limit': max_pubs,
-            'offset': 0,
-            'searchPersonEfrsbMessage': 'true',
-            'searchPersonBankruptMessage': 'true',
-            'searchAmReport': 'true'
-        }
-        
-        session.headers['Referer'] = f"{FEDRESURS_URL}/{endpoint}/{guid}"
-        resp_pubs = session.get(pubs_url, params=pubs_params, timeout=15)
-        resp_pubs.raise_for_status()
-        pubs_data = resp_pubs.json()
-        
-        total_pubs = pubs_data.get('total', 0)
-        publications = pubs_data.get('pageData', [])
+        # Ограничиваем количество публикаций
+        data['publications'] = data['publications'][:max_pubs]
         
         return {
             'success': True,
-            'inn': inn,
-            'guid': guid,
-            'name': name,
-            'full_name': full_name,
-            'endpoint': endpoint,
-            'total_pubs': total_pubs,
-            'publications': publications,
-            'url': f"{FEDRESURS_URL}/{endpoint}/{guid}"
+            'inn': data['inn'] or inn,
+            'name': data['name'] or 'Не указано',
+            'endpoint': data['type'],
+            'total_pubs': data['total_pubs'],
+            'publications': data['publications'],
+            'url': profile_url
         }
         
-    except requests.Timeout:
-        logger.error(f"Timeout для ИНН {inn}")
-        return {
-            'success': False,
-            'message': f"⏱ Превышено время ожидания\n\nСервер ЕФРСБ не отвечает. Попробуйте позже"
-        }
-    except requests.RequestException as e:
-        logger.error(f"Ошибка запроса для ИНН {inn}: {e}")
-        return {
-            'success': False,
-            'message': f"💥 Ошибка соединения с сервером\n\nПопробуйте повторить запрос"
-        }
     except Exception as e:
         logger.error(f"Неожиданная ошибка для ИНН {inn}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {
             'success': False,
-            'message': f"💥 Произошла ошибка при обработке\n\nОбратитесь к администратору"
+            'message': f"💥 Произошла ошибка при обработке\n\nПопробуйте позже или обратитесь к администратору"
         }
 
 def format_result(data, show_details=True):
@@ -242,19 +421,15 @@ def format_result(data, show_details=True):
         result += f"📄 *Последние публикации:*\n\n"
         
         for i, pub in enumerate(data['publications'], 1):
-            number = pub.get('number', 'Без номера')
-            type_name = pub.get('typeName', pub.get('type', 'Не указан тип'))
-            date = pub.get('datePublish', '')[:10] if pub.get('datePublish') else 'Нет даты'
-            
-            result += f"*{i}.* `{number}`\n"
-            result += f"   📌 {type_name}\n"
-            result += f"   📅 {date}\n\n"
+            result += f"*{i}.* `№{pub.get('number', 'Б/Н')}`\n"
+            result += f"   📌 {pub.get('type', 'Не указан')[:50]}\n"
+            result += f"   📅 {pub.get('date', 'Нет даты')}\n\n"
         
         if data['total_pubs'] > len(data['publications']):
             remain = data['total_pubs'] - len(data['publications'])
             result += f"_... и ещё {remain} публикаций_\n"
     
-    return result[:4096]  # Telegram limit
+    return result[:4096]
 
 # ============== KEYBOARDS ==============
 def get_main_menu():
@@ -347,9 +522,9 @@ def get_max_pubs_menu():
 def start(message):
     """Стартовое сообщение"""
     welcome_text = (
-        "🔍 *Fedresurs Bot*\n\n"
+        "🔍 *Fedresurs Parser Bot*\n\n"
         "Проверка статуса банкротства физических и юридических лиц "
-        "по базе ЕФРСБ (Единый федеральный реестр сведений о банкротстве)\n\n"
+        "через ЕФРСБ (Единый федеральный реестр сведений о банкротстве)\n\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         "💡 *Как пользоваться:*\n\n"
         "1️⃣ Используйте inline-режим: `@botname ИНН`\n"
@@ -375,15 +550,13 @@ def handle_message(message):
     inn = re.sub(r'\D', '', message.text)[:12]
     
     if len(inn) in [10, 12]:
-        # Это похоже на ИНН
         bot.send_chat_action(message.chat.id, 'typing')
-        msg = bot.send_message(message.chat.id, "🔍 Ищу информацию...")
+        msg = bot.send_message(message.chat.id, "🔍 Парсинг данных с сайта...\n_Это может занять несколько секунд_", parse_mode='Markdown')
         
         settings = get_user_settings(message.from_user.id)
         data = parse_bankrot(inn, settings['max_pubs'])
         result = format_result(data, settings['show_details'])
         
-        # Проверяем, есть ли в избранном
         user_inns = get_user_inns(message.from_user.id)
         in_favorites = any(saved_inn == inn for saved_inn, _ in user_inns)
         
@@ -398,7 +571,6 @@ def handle_message(message):
         
         logger.info(f"Пользователь {message.from_user.id} запросил ИНН {inn}")
     else:
-        # Неверный формат
         bot.send_message(
             message.chat.id,
             "❌ Неверный формат\n\n"
@@ -414,7 +586,6 @@ def handle_callback(call):
     data = call.data
     
     try:
-        # Главное меню
         if data == "menu":
             bot.edit_message_text(
                 "🏠 *Главное меню*\n\nВыберите действие:",
@@ -425,7 +596,6 @@ def handle_callback(call):
             )
             bot.answer_callback_query(call.id)
         
-        # Поиск
         elif data == "search":
             bot.edit_message_text(
                 "🔍 *Поиск по ИНН*\n\n"
@@ -440,7 +610,6 @@ def handle_callback(call):
             )
             bot.answer_callback_query(call.id, "Отправьте ИНН")
         
-        # Избранное
         elif data == "favorites":
             inns = get_user_inns(user_id)
             if not inns:
@@ -467,12 +636,11 @@ def handle_callback(call):
                 )
             bot.answer_callback_query(call.id)
         
-        # Поиск из избранного
         elif data.startswith("fav_search:"):
             inn = data.split(":")[1]
-            bot.answer_callback_query(call.id, "🔍 Поиск...")
+            bot.answer_callback_query(call.id, "🔍 Парсинг...")
             bot.edit_message_text(
-                "🔍 Загрузка данных...",
+                "🔍 Загрузка данных с сайта...",
                 call.message.chat.id,
                 call.message.message_id
             )
@@ -490,16 +658,13 @@ def handle_callback(call):
                 disable_web_page_preview=True
             )
         
-        # Добавить в избранное
         elif data.startswith("add_fav:"):
             inn = data.split(":")[1]
-            # Получаем имя из последнего поиска
             result_data = parse_bankrot(inn, 1)
             name = result_data.get('name', '') if result_data['success'] else ''
             
             if add_inn(user_id, inn, name):
                 bot.answer_callback_query(call.id, "⭐️ Добавлено в избранное")
-                # Обновляем кнопки
                 bot.edit_message_reply_markup(
                     call.message.chat.id,
                     call.message.message_id,
@@ -508,7 +673,6 @@ def handle_callback(call):
             else:
                 bot.answer_callback_query(call.id, "❌ Ошибка сохранения")
         
-        # Удалить из избранного
         elif data.startswith("del_fav:"):
             inn = data.split(":")[1]
             if delete_inn(user_id, inn):
@@ -521,7 +685,6 @@ def handle_callback(call):
             else:
                 bot.answer_callback_query(call.id, "❌ Ошибка удаления")
         
-        # Очистить избранное
         elif data == "clear_favorites":
             with get_db() as conn:
                 c = conn.cursor()
@@ -537,7 +700,6 @@ def handle_callback(call):
                 reply_markup=get_back_button()
             )
         
-        # Обновить результат
         elif data.startswith("refresh:"):
             inn = data.split(":")[1]
             bot.answer_callback_query(call.id, "🔄 Обновление...")
@@ -558,7 +720,6 @@ def handle_callback(call):
                 disable_web_page_preview=True
             )
         
-        # Настройки
         elif data == "settings":
             bot.edit_message_text(
                 "⚙️ *Настройки*\n\n"
@@ -570,7 +731,6 @@ def handle_callback(call):
             )
             bot.answer_callback_query(call.id)
         
-        # Переключить детали
         elif data == "toggle_details":
             settings = get_user_settings(user_id)
             new_value = not settings['show_details']
@@ -586,7 +746,6 @@ def handle_callback(call):
                 reply_markup=get_settings_menu(user_id)
             )
         
-        # Изменить количество публикаций
         elif data == "change_max_pubs":
             bot.edit_message_text(
                 "⚙️ *Количество публикаций*\n\n"
@@ -598,7 +757,6 @@ def handle_callback(call):
             )
             bot.answer_callback_query(call.id)
         
-        # Установить количество публикаций
         elif data.startswith("set_pubs:"):
             num = int(data.split(":")[1])
             settings = get_user_settings(user_id)
@@ -614,7 +772,6 @@ def handle_callback(call):
                 reply_markup=get_settings_menu(user_id)
             )
         
-        # Справка
         elif data == "help":
             help_text = (
                 "ℹ️ *Справка*\n\n"
@@ -653,6 +810,8 @@ def handle_callback(call):
     
     except Exception as e:
         logger.error(f"Ошибка обработки callback {data}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         bot.answer_callback_query(call.id, "❌ Произошла ошибка")
 
 # ============== INLINE MODE ==============
@@ -675,7 +834,6 @@ def inline_query(query):
         bot.answer_inline_query(query.id, [r], cache_time=1)
         return
     
-    # Выполняем поиск
     data = parse_bankrot(inn, 5)
     result_text = format_result(data, True)
     
@@ -705,7 +863,7 @@ def inline_empty(query):
     """Пустой inline-запрос"""
     r = InlineQueryResultArticle(
         id="help",
-        title="🔍 Fedresurs Bot",
+        title="🔍 Fedresurs Parser Bot",
         description="Введите ИНН для поиска (10 или 12 цифр)",
         input_message_content=InputTextMessageContent(
             "💡 *Как использовать:*\n\n"
@@ -722,10 +880,13 @@ def inline_empty(query):
 if __name__ == '__main__':
     try:
         init_db()
-        logger.info("🚀 Fedresurs Bot запущен")
-        logger.info(f"📊 Режим: {os.getenv('BOT_TOKEN')[:10]}...")
+        logger.info("🚀 Fedresurs Parser Bot запущен")
+        logger.info("📄 Режим: HTML парсинг")
+        logger.info(f"🔗 URL: {FEDRESURS_URL}/entities")
         bot.infinity_polling(timeout=30, long_polling_timeout=30)
     except KeyboardInterrupt:
         logger.info("⛔️ Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
